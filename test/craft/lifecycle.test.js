@@ -221,7 +221,7 @@ test('another bot craft does not skip this bot spawn recovery', async () => {
   assert.equal(pool.drainWaiters.size, 0)
 })
 
-test('disabling a bot cancels its queued recovery and unblocks later tasks', async () => {
+test('disabling a bot cancels its queued recovery while later tasks already reach their normal guards', async () => {
   const pool = new BotTaskPool()
   const original = { botId: 'A', ready: false }
   const other = { botId: 'B', bot: { username: 'B' }, ready: true,
@@ -231,7 +231,7 @@ test('disabling a bot cancels its queued recovery and unblocks later tasks', asy
     run: () => { throw new Error('disabled bot must not recover') } })
   let ran = false
   const next = pool.enqueue({ type: 'withdraw', run: () => { ran = true } })
-  assert.equal(ran, false)
+  assert.equal(ran, true)
   assert.equal(pool.cancelQueuedCraftRecovery('A'), 1)
   assert.equal(await recovery, null)
   await next

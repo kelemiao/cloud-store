@@ -1755,7 +1755,7 @@ class CloudStoreWebServer {
     const rows = this.db.db.prepare(`
       SELECT id, kind, status, owner_uuid AS ownerUuid, username,
              item_key AS itemKey, item_id AS itemId, display_name AS displayName,
-             nbt_json AS nbtJson, meta_json AS metaJson, amount, note,
+             nbt_json AS nbtJson, meta_json AS metaJson, amount, balance_adjusted AS balanceAdjusted, note,
              created_at AS createdAt, resolved_at AS resolvedAt
       FROM inventory_mismatches
       ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
@@ -1784,7 +1784,7 @@ class CloudStoreWebServer {
       const amount = Number(row.amount || 0)
       if (row.kind === 'extra') extraAmount += amount
       if (row.kind === 'missing') missingAmount += amount
-      result.push({ ...item, id: row.id, kind: row.kind, status: row.status, ownerUuid: row.ownerUuid, ownerLabel, username: row.username, amount, note: row.note, createdAt: row.createdAt, resolvedAt: row.resolvedAt })
+      result.push({ ...item, id: row.id, kind: row.kind, status: row.status, ownerUuid: row.ownerUuid, ownerLabel, username: row.username, amount, balanceAdjusted: row.balanceAdjusted, note: row.note, createdAt: row.createdAt, resolvedAt: row.resolvedAt })
     }
 
     return { ok: true, stats: { openRows: result.filter(row => row.status === 'open').length, extraAmount, missingAmount }, rows: result }
@@ -2287,7 +2287,7 @@ class CloudStoreWebServer {
     const row = this.db.db.prepare(`
       SELECT id, kind, status, owner_uuid AS ownerUuid, username,
              item_key AS itemKey, item_id AS itemId, display_name AS displayName,
-             nbt_json AS nbtJson, meta_json AS metaJson, amount
+             nbt_json AS nbtJson, meta_json AS metaJson, amount, balance_adjusted AS balanceAdjusted
       FROM inventory_mismatches
       WHERE id = ?
       LIMIT 1
@@ -2297,11 +2297,13 @@ class CloudStoreWebServer {
     if (!row.ownerUuid) throw new Error('这条异常没有明确归属，不能直接扣除。')
     const item = this.db.getItemByKey(row.itemKey) || this.db.rowToItem(row)
     const current = this.db.getBalance(row.ownerUuid, row.itemKey)
-    const amount = Math.min(current, Number(row.amount || 0))
+    const adjusted = Math.min(Number(row.amount || 0), Math.max(0, Number(row.balanceAdjusted || 0)))
+    const remaining = Math.max(0, Number(row.amount || 0) - adjusted)
+    const amount = Math.min(current, remaining)
     if (amount <= 0) {
       // 账面已无可扣除数量：常见于同步对账时已自动扣过。这里不再报错卡死，
       // 只关闭留痕，避免这条异常永远无法处理。
-      const closeNote = 'Web关闭留痕：账面已无可扣除数量'
+      const closeNote = remaining <= 0 ? 'Web关闭留痕：此缺失数量已自动扣除，无需再次扣账' : 'Web关闭留痕：账面已无可扣除数量'
       this.db.db.prepare(`
         UPDATE inventory_mismatches
         SET status = 'resolved',
@@ -2312,7 +2314,9 @@ class CloudStoreWebServer {
             END
         WHERE id = ?
       `).run(closeNote, closeNote, id)
-      return `账面已无可扣除的 ${row.displayName || row.itemId}（可能同步时已自动扣除），异常留痕已关闭。`
+      return remaining <= 0
+        ? `此缺失数量已自动扣除，${row.displayName || row.itemId} 的异常留痕已关闭。`
+        : `账面已无可扣除的 ${row.displayName || row.itemId}，异常留痕已关闭。`
     }
 
     const changed = [{ ...item, amount }]
@@ -2322,13 +2326,14 @@ class CloudStoreWebServer {
       this.db.db.prepare(`
         UPDATE inventory_mismatches
         SET status = 'resolved',
+            balance_adjusted = ?,
             resolved_at = CURRENT_TIMESTAMP,
             note = CASE
               WHEN note = '' THEN ?
               ELSE note || '；' || ?
             END
         WHERE id = ?
-      `).run(`Web已扣除账本库存 x${amount}`, `Web已扣除账本库存 x${amount}`, id)
+      `).run(adjusted + amount, `Web已扣除账本库存 x${amount}`, `Web已扣除账本库存 x${amount}`, id)
     })
     return `已扣除 ${this.db.ownerLabel(row.ownerUuid)} 的 ${row.displayName || row.itemId} x${amount}，异常已处理。`
   }

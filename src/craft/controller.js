@@ -3,7 +3,6 @@
 const { randomUUID } = require('node:crypto')
 const CraftLedger = require('./ledger')
 const { planToCraftCommand } = require('./index')
-const { readServerContainer } = require('./server-container-evidence')
 
 function merge (items) {
   const totals = new Map()
@@ -98,10 +97,12 @@ class CraftController {
   // grid items to the server-side inventory; parking the cursor merges it back
   // into backpack slots. Both moves relocate existing items without creating or
   // destroying any, so the operation's physicalTotals baseline stays valid.
-  async settleResidue () {
+  async settleResidue (check = () => {}) {
+    check()
     if (this.bot.currentWindow) {
       try { this.bot.closeWindow(this.bot.currentWindow) } catch {}
       await new Promise(resolve => setTimeout(resolve, 150))
+      check()
     }
     const selectedItem = this.bot.inventory.selectedItem
     if (!selectedItem) return
@@ -119,13 +120,15 @@ class CraftController {
       }
     }
     if (target < 0) throw new Error(`无法自愈光标残留：${cursor.displayName || cursor.itemId}（背包没有可合并或空置的槽位）。`)
+    check()
     await this.bot.clickWindow(target, 0, 0)
+    check()
   }
 
   // One settle attempt must clear window + cursor; crafting-grid phantoms are
   // server-side-packet staleness and get corrected by the container re-read.
-  async assertSettledResidue () {
-    await this.settleResidue()
+  async assertSettledResidue (check) {
+    await this.settleResidue(check)
     if (this.bot.currentWindow || this.bot.inventory.selectedItem) {
       throw new Error(`自愈后仍存在光标/窗口残留：${this.residueDescription()}；需要人工核对。`)
     }
@@ -232,30 +235,18 @@ class CraftController {
 
   async run (request) {
     if (this.active) throw new Error('合成任务尚未结束。')
+    // Recover before taking the new order's non-reentrant warehouse lock.
+    if (this.ledger.pending(this.botId).length) {
+      await withTimeout(this.recover(), AUTO_RECOVER_TIMEOUT_MS)
+      if (this.ledger.pending(this.botId).length) throw new Error('本机器人存在未恢复的合成任务，请先执行 !合成恢复。')
+    }
     const abort = new AbortController()
     const lease = { abort }
     this.active = lease
     try {
       return await this.warehouse.withWarehouseLock(async () => {
-        // 别的 bot 留下的恢复记录（本 bot 的记录已在恢复重试后销账/自愈闭环）。
-        // 之前这里一刀切拒绝所有 pending 记录：本 bot 的历史失败会把后续所有
-        // 合成请求永久打挂（2026-11-05 生产：恢复对账失败后锁库 19 分钟，
-        // 期间新合成请求全部被拒）。现在本 bot 的记录在锁外先行自愈
-        // （下方 recover() 自带重试+差异销账，不再永久锁库）。
         const pendingOthers = this.ledger.pending().filter(operation => operation.botId !== this.botId)
         if (pendingOthers.length) throw new Error('存在其他机器人未恢复的合成任务，请先执行 !合成恢复。')
-        if (this.ledger.pending(this.botId).length) {
-          // run() 持有自己的执行租约（this.active），恢复复用同一租约而不是
-          // 另起：另起会被 recover() 的 busy 检查拒绝。恢复期间取消信号也
-          // 挂在本任务的 abort 上，行为与主流程一致。
-          this.active = null
-          try {
-            await withTimeout(this.recover(), AUTO_RECOVER_TIMEOUT_MS)
-          } finally {
-            this.active = lease
-          }
-          if (this.ledger.pending(this.botId).length) throw new Error('本机器人存在未恢复的合成任务，请先执行 !合成恢复。')
-        }
         await this.validateOwner?.(request.owner, request.actor)
         // 开工先自愈窗口/光标残留：多为上次取货/拆盒操作遗留的窗口未关或光标
         // 未归位（服务器包 staleness 的幻影），关窗重读即可纠正。之前直接断言
@@ -405,80 +396,65 @@ class CraftController {
 
   async recover () {
     if (this.active || this.executor?.isBusy()) throw new Error('旧合成操作尚未结束，不能开始恢复。')
-    let lastError = null
-    for (let attempt = 0; attempt < RECOVER_RETRY_ATTEMPTS; attempt++) {
-      const lease = { abort: new AbortController() }
-      this.active = lease
-      try {
-        return await this.warehouse.withWarehouseLock(() => {
-          const check = () => {
-            if (lease.abort.signal.aborted) {
-              const reason = lease.abort.signal.reason
-              if (reason instanceof Error) reason.cancelled = true
-              throw reason
-            }
-          }
-          return this.recoverLocked(check)
-        })
-      } catch (error) {
-        lastError = error
-        // 主动取消（死亡/断线 invalidate 触发 cancel）不能在旧连接上重试。
-        if (error?.cancelled || lease.abort.signal.aborted) throw error
-        if (!this.ledger.pending(this.botId).length) throw error
-        if (attempt + 1 < RECOVER_RETRY_ATTEMPTS) await sleep(RECOVER_RETRY_DELAY_MS)
-      } finally {
-        if (this.active === lease) this.active = null
+    const lease = { abort: new AbortController() }
+    this.active = lease
+    const check = () => {
+      if (lease.abort.signal.aborted) {
+        const reason = lease.abort.signal.reason
+        if (reason instanceof Error) reason.cancelled = true
+        throw reason
       }
+      this.warehouse.assertConnectionHealthy?.()
     }
-    // 重试无果。只有当"物品已全部回仓、仅对账不可确证"（对账类失败）才降级
-    // 销账：此时实物安全在库，差异只影响账目分配，登记库存异常即可闭环。
-    // 其它失败（无容器、存库空间不足、断线取消）意味着实物还在背包/危险中，
-    // 必须保留恢复记录等 spawn/重连钩子或人工，销账会丢归属。
-    if (!this.canSettleRecoveryFailure(lastError)) throw lastError
-    // 差异通常来自卡顿期包竞速的局部读数漂移：把对账差异记入库存异常并按
-    // 失败销账（预留归还、归属保留），不再锁全库等人工 !合成恢复。
-    const settled = this.settleRecoveryDiff(lastError)
-    const operation = this.ledger.pending(this.botId)[0]
-    this.ledger.finish(operation.id, 'failed', `恢复对账重试 ${RECOVER_RETRY_ATTEMPTS} 次未通过，已按库存差异登记销账：${lastError.message}`)
-    return { status: 'recovered', operationId: operation.id, diffRegistered: settled }
+    try {
+      // All retries and the fallback share one lease/lock. A gap between them
+      // would invalidate the warehouse baseline used by the final reconciliation.
+      return await this.warehouse.withWarehouseLock(async () => {
+        let lastError
+        for (let attempt = 0; attempt < RECOVER_RETRY_ATTEMPTS; attempt++) {
+          try {
+            check()
+            return await this.recoverLocked(check)
+          } catch (error) {
+            lastError = error
+            if (error?.cancelled || lease.abort.signal.aborted) throw error
+            if (!this.ledger.pending(this.botId).length) throw error
+            if (attempt + 1 < RECOVER_RETRY_ATTEMPTS) await sleep(RECOVER_RETRY_DELAY_MS)
+          }
+        }
+        check()
+        if (!this.canSettleRecoveryFailure(lastError)) throw lastError
+        // Reconcile only net changes since this journal's baseline. Unvisited
+        // barrels retain their cached slots and must not create false shortages.
+        const actual = this.physicalTotals()
+        check()
+        this.assertCleanInventory()
+        return this.settleRecoveryDiff(lastError, actual, check)
+      })
+    } finally {
+      if (this.active === lease) this.active = null
+    }
   }
 
-  // 对账类失败可安全销账的判据：背包空（实物全部回仓）且无窗口/光标/合成格
-  // 残留。对账错误本身（"实际消耗和产出"/"实物与记录不一致"）天然满足——
-  // recoverLocked 在对账前已 depositAllPossible 并 assertCleanInventory。
   canSettleRecoveryFailure (error) {
-    if (this.ledger.pending(this.botId).length !== 1) return false
-    if (this.hasInventoryResidue()) return false
-    if (!this.db.listChests().length) return false
-    return /人工核对|实际消耗和产出|实物与记录不一致|实物总量校验/.test(String(error?.message || ''))
+    return Boolean(error?.recoveryMismatch && this.ledger.pending(this.botId).length === 1 &&
+      !this.hasInventoryResidue() && this.db.listChests().length)
   }
 
-  // 对账失败的兜底销账：把实物与中断基线之间的逐 key 差异登记为库存异常
-  // （同 reconcileTotalsToMomo 的 missing/excess 语义），留管理员在 Web 端复核；
-  // 预留与归属不动（finish 已释放预留）。找不到记录时返回 false。
-  // 用 recoveryBaseline（中断瞬间基线）而非被 checkpoint 覆盖后的 physicalTotals，
-  // 否则背包回仓会自证为"无差异"。
-  settleRecoveryDiff (error) {
+  settleRecoveryDiff (error, actual, check) {
     const operation = this.ledger.pending(this.botId)[0]
-    if (!operation) return false
-    const baseline = merge(operation.data.recoveryBaseline || operation.data.physicalTotals || [])
-    const actual = merge(this.physicalTotals())
-    const expected = new Map(baseline.map(item => [item.itemKey, item.amount]))
-    const actualMap = new Map(actual.map(item => [item.itemKey, item.amount]))
-    const keys = new Set([...expected.keys(), ...actualMap.keys()])
-    let registered = 0
-    for (const key of keys) {
-      const diff = (actualMap.get(key) || 0) - (expected.get(key) || 0)
-      if (!diff) continue
-      const sample = actual.find(item => item.itemKey === key) || baseline.find(item => item.itemKey === key)
-      if (!sample) continue
-      this.db.addInventoryMismatch?.(diff > 0 ? 'excess' : 'missing', operation.owner.uuid,
-        operation.owner.username || operation.owner.uuid,
-        sample, Math.abs(diff),
-        `合成恢复对账失败（${error?.message || 'unknown'}）：实物与中断基线差 x${Math.abs(diff)}，已登记待管理员复核；合成记录按失败销账。`)
-      registered += Math.abs(diff)
-    }
-    return registered > 0
+    if (!operation || !Array.isArray(actual)) throw new Error('恢复差异结算缺少本轮实物账本。')
+    const baseline = operation.data.recoveryIntent?.baseline || operation.data.recoveryBaseline || operation.data.physicalTotals
+    if (!Array.isArray(baseline)) throw new Error('恢复差异结算缺少原始实物基线。')
+    return this.ledger.transaction(() => {
+      check()
+      const result = this.db.reconcileRecoveryDeltaToMomo(baseline, actual, operation.id)
+      this.ledger.checkpoint(operation.id, 'ready', { ...operation.data, held: [], pending: null,
+        physicalTotals: actual, recoveryBaseline: baseline, recoveryReconciled: true })
+      this.ledger.finish(operation.id, 'failed', `恢复对账重试 ${RECOVER_RETRY_ATTEMPTS} 次未通过，已同步实物账目并登记差异：${error.message}`)
+      return { status: 'recovered', operationId: operation.id,
+        diffRegistered: Boolean(result.addedToMomo.length || result.removedFromMomo.length || result.unresolved.length) }
+    })
   }
 
   async recoverLocked (check) {
@@ -487,68 +463,59 @@ class CraftController {
     if (!operations.length) return { status: 'empty' }
     if (operations.length !== 1) throw new Error('同一机器人存在多个合成恢复记录，需要人工核对。')
     let operation = operations[0]
-    const phase = operation.data.recoveryPhase || operation.phase
-    // 重试的恢复以中断瞬间基线（recoveryBaseline）对账：data.physicalTotals 在
-    // 第一次尝试的 deposit checkpoint 后会变成 depositBaseline，用它对账会把
-    // "背包带回的物品"自证为一致，吞掉真实的对账失败。
-    const baseline = operation.data.recoveryBaseline || operation.data.physicalTotals
+    this.db.assertNoPendingCraft(operation.id)
+    const saved = operation.data.recoveryIntent
+    const baseline = saved?.baseline || operation.data.recoveryBaseline || operation.data.physicalTotals
     if (!baseline) throw new Error('恢复记录缺少实物基线，需要人工核对。')
-    await this.assertSettledResidue()
+    await this.assertSettledResidue(check)
+    check()
     await this.warehouse.goHomeIfAway()
     check()
-    const heldBeforeDeposit = this.inventory()
-    // Keep a copy of the interrupted intent: the checkpoints below clear
-    // data.pending so the store/finish path never sees a live conversion.
-    const pendingIntent = operation.data.pending || null
-    // Mirrors withdraw interruption recovery (depositInventoryWithoutBalance):
-    // park the interrupted backpack into the warehouse FIRST, then reconcile
-    // the ledger against the combined totals. The old flow instead walked
-    // around opening every chest for server snapshots before deciding; the
-    // deposit path already verifies each chest server-side as it stores, so
-    // recovery cost is bounded by what the backpack actually holds.
     if (!this.db.listChests().length) throw new Error('恢复没有可用的入库木桶；请先登记可用容器。')
+    if (!saved) {
+      operation = this.ledger.checkpoint(operation.id, operation.phase, { ...operation.data, recoveryIntent: {
+        phase: operation.data.recoveryPhase || operation.phase,
+        baseline, pending: operation.data.pending || null, observed: this.inventory()
+      } })
+    }
+    const intent = operation.data.recoveryIntent
     const depositBaseline = this.physicalTotals()
-    // 保留中断瞬间的原始基线：下面的 checkpoint 会把 physicalTotals 覆盖成
-    // deposit 后的值；对账失败降级销账（settleRecoveryDiff）需要用原始基线
-    // 计算差异，depositBaseline 会把"背包带回来的物品"自证为一致。
-    const recoveryBaseline = operation.data.recoveryBaseline || baseline
     operation = this.ledger.checkpoint(operation.id, 'storing', {
-      ...operation.data, held: heldBeforeDeposit, pending: null, physicalTotals: depositBaseline, recoveryBaseline
+      ...operation.data, held: this.inventory(), pending: null, physicalTotals: depositBaseline,
+      recoveryBaseline: baseline
     })
     await this.warehouse.depositAllPossible({ requireServerEvidence: true })
-    if (!same(this.physicalTotals(), depositBaseline)) throw new Error('合成回库实物总量校验失败。')
-    const leftover = this.inventory()
-    if (leftover.length) throw new Error('仓库空间不足，恢复的物品保留在机器人背包并等待恢复。')
-    this.assertCleanInventory()
-    operation = this.ledger.checkpoint(operation.id, 'ready', { ...operation.data, held: [], pending: null })
     check()
-    // Reconcile the journal now that every interrupted item is back in the
-    // warehouse ledger. physicalTotals reads the same DB slots the deposit
-    // updated, so totals still include everything the bot was holding.
+    if (this.inventory().length) throw new Error('仓库空间不足，恢复的物品保留在机器人背包并等待恢复。')
+    this.assertCleanInventory()
     const actual = this.physicalTotals()
-    if (phase === 'crafting' || pendingIntent) {
-      const pending = pendingIntent
+    const mismatch = message => Object.assign(new Error(message), { recoveryMismatch: true })
+    if (!same(actual, depositBaseline)) throw mismatch('合成回库实物总量校验失败。')
+    const pending = intent.pending
+    let conversion = false
+    if (intent.phase === 'crafting' || pending) {
       if (!pending) throw new Error('恢复记录缺少合成意图。')
       if (same(actual, baseline)) {
-        // Nothing was consumed: the withdrawal had not reached the table.
+        // The inputs were returned unchanged: no conversion to book.
       } else if (pending.expectedProduced.every(item => item.itemKey) &&
         same(actual, converted(baseline, pending.expectedConsumed, pending.expectedProduced)) &&
-        same(heldBeforeDeposit, pending.expectedProduced)) {
-        // confirm validates against the crafting journal, so re-enter that
-        // phase with the pre-deposit backpack before settling the conversion.
-        operation = this.ledger.checkpoint(operation.id, 'crafting', {
-          ...operation.data, held: pending.before, pending, physicalTotals: depositBaseline
+        same(intent.observed, pending.expectedProduced)) conversion = true
+      else throw mismatch('无法确认中断合成的实际消耗和产出；已回库，需要同步核对。')
+    } else if (!same(actual, baseline)) throw mismatch('中断取存的实物与记录不一致，需要同步核对。')
+    check()
+    // A crash/finish failure must not leave a committed conversion with the old
+    // pre-conversion recovery intent. Roll back all ledger changes together.
+    this.ledger.transaction(() => {
+      if (conversion) {
+        operation = this.ledger.checkpoint(operation.id, 'crafting', { ...operation.data, held: pending.before, pending })
+        operation = this.ledger.confirm(operation.id, pending.stepId, pending.expectedConsumed, intent.observed, {
+          ...operation.data, before: pending.before, after: intent.observed, held: [], pending: null,
+          physicalTotals: actual, recovery: true
         })
-        operation = this.ledger.confirm(operation.id, pending.stepId, pending.expectedConsumed, heldBeforeDeposit, {
-          ...operation.data, before: pending.before, after: heldBeforeDeposit, held: [], pending: null, physicalTotals: actual, recovery: true
-        })
-        // confirm left phase 'storing' with a pre-deposit held snapshot; the
-        // items are physically back in the warehouse already, so re-mark the
-        // journal ready (empty held) before finishing.
-        operation = this.ledger.checkpoint(operation.id, 'ready', { ...operation.data, held: [], pending: null, physicalTotals: actual })
-      } else throw new Error('无法确认中断合成的实际消耗和产出；已回库并保留归属及预留，需要人工核对。')
-    } else if (!same(actual, baseline)) throw new Error('中断取存的实物与记录不一致，需要人工核对。')
-    this.ledger.finish(operation.id, 'failed', 'interrupted craft safely returned; request may be submitted again')
+      }
+      operation = this.ledger.checkpoint(operation.id, 'ready', { ...operation.data, held: [], pending: null, physicalTotals: actual })
+      this.ledger.finish(operation.id, 'failed', 'interrupted craft safely returned; request may be submitted again')
+    })
     return { status: 'recovered', operationId: operation.id }
   }
 }

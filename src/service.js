@@ -951,6 +951,13 @@ class CloudStoreService {
   }
 
   async runExclusive (username, type, fn, extra = {}) {
+    // The task pool already owns this craft's exclusive lease. Recover directly
+    // before setting active; enqueueing another exclusive task here would wait
+    // on this very task. Other bots' journals retain the upstream global guard.
+    if (type === 'craft' && this.db.hasPendingCraft?.(this.botId)) {
+      if (this.connectionInvalidated) throw new Error('连接已失效，合成恢复留待原机器人重连。')
+      await this.withBotContext(() => this.getCraftController().recover())
+    }
     if (type !== 'craft_recovery') this.db.assertNoPendingCraft?.()
     const migration = this.db.runDeferredMigrations?.()
     if (migration?.catalogError || migration?.offlineIdentityError) {
@@ -959,7 +966,7 @@ class CloudStoreService {
     const active = { type, username, cancelled: false, dead: false, phase: 'start', player: null, ...extra }
     this.active = active
     try {
-      await this.db.runWithCommandContext(active.commandLogId, () => this.withBotContext(fn))
+      return await this.db.runWithCommandContext(active.commandLogId, () => this.withBotContext(fn))
     } catch (error) {
       if (error && typeof error === 'object' && !error.commandContext) {
         error.commandContext = { ...active }
@@ -995,7 +1002,7 @@ class CloudStoreService {
         const stickyBusy = stickyWorker && (stickyWorker.active || stickyWorker.recoveringFromDeath)
         if (position > 1 || stickyBusy || ![...this.taskPool.workers].some(worker => worker.ready && !worker.active)) {
           this.msg(username, stickyWorker
-            ? `任务已加入队列，将等待 ${this.bot.username} 处理，前面还有 ${Math.max(0, position - 1)} 个任务。`
+            ? `任务已加入队列，将等待 ${stickyWorker.bot?.username || stickyWorker.botId || this.bot.username} 处理，前面还有 ${Math.max(0, position - 1)} 个任务。`
             : `任务已加入队列，前面还有 ${Math.max(0, position - 1)} 个任务。`)
         }
       }
@@ -2193,11 +2200,40 @@ class CloudStoreService {
 
   async handleCraftRecovery (username) {
     if (!this.isAdmin(username)) throw new Error('合成恢复只允许系统管理员使用。')
-    return this.enqueueTask(username, 'craft_recovery', async worker => {
-      const result = await worker.getCraftController().recover()
-      worker.msg(username, result.status === 'empty' ? '本机器人没有待恢复的合成任务。' : '合成中断状态已核验，物品已回云仓；可重新提交合成。')
-      return result
-    }, { exclusive: true, stickyWorker: this })
+    const botIds = [...new Set((this.db.pendingCraftBotIds?.() || []).filter(Boolean))]
+    if (!botIds.length) {
+      this.msg(username, '本机器人没有待恢复的合成任务。')
+      return { status: 'empty' }
+    }
+    const outcomes = []
+    for (const botId of botIds) {
+      const owner = this.taskPool
+        ? [...this.taskPool.workers].find(worker => worker.botId === botId)
+        : (this.botId === botId ? this : null)
+      if (!this.taskPool && !owner) {
+        this.msg(username, `待恢复机器人 ${botId} 当前离线，等待原机器人重新上线后核对。`)
+        outcomes.push({ status: 'waiting', botId })
+        continue
+      }
+      const stickyWorker = owner || { botId }
+      const canStart = !this.taskPool || Boolean(this.taskPool.eligibleWorkerForTask({ type: 'craft_recovery', stickyWorker }))
+      const task = Promise.resolve(this.enqueueTask(username, 'craft_recovery', async worker => {
+        const result = await worker.getCraftController().recover()
+        this.msg(username, result.status === 'empty'
+          ? `机器人 ${botId} 没有待恢复的合成任务。`
+          : result.diffRegistered
+            ? '合成中断状态已核验，物品已回云仓；对账差异已登记库存异常，请在 Web 管理页复核；可重新提交合成。'
+            : '合成中断状态已核验，物品已回云仓；可重新提交合成。')
+        return result
+      }, { exclusive: true, stickyWorker }))
+      if (canStart) outcomes.push(await task)
+      else {
+        this.msg(username, `已为 ${botId} 排队恢复，等待原机器人上线并结束旧操作；恢复完成前仍按原有规则保护库存。`)
+        task.catch(error => this.handleCommandError(username, error))
+        outcomes.push({ status: 'waiting', botId })
+      }
+    }
+    return outcomes.length === 1 ? outcomes[0] : outcomes
   }
 
   // Automatic craft recovery: a bot that spawns (first login, reconnect after a

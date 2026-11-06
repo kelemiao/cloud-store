@@ -255,3 +255,16 @@ test('strict withdrawal does not credit unexplained extra stock to momo', async 
     assert.equal(f.db.getOwnerBalances(f.config.momoOwner).length, 0)
   } finally { f.close() }
 })
+
+
+test('recovery does not rescan after a completed deposit leaves a storing journal', async () => {
+  const f = fixture({ packetMode: 'missing' })
+  try {
+    const { controller, operation, ledger } = storingOperation(f)
+    await assert.rejects(controller.store(operation), /服务端|server|快照/)
+    f.warehouse.goHomeIfAway = async () => {}
+    assert.equal((await controller.recover()).status, 'recovered')
+    assert.equal(ledger.pending().length, 0)
+    assert.equal(f.opens(), 2, 'recovery must not reopen every registered barrel')
+  } finally { f.close() }
+})

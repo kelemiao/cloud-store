@@ -38,6 +38,7 @@ class BotTaskPool {
 
   unregister (service) {
     this.workers.delete(service)
+    this.dispatch()
   }
 
   cancelQueuedForWorker (worker) {
@@ -102,7 +103,8 @@ class BotTaskPool {
         ? [...this.workers].find(worker => worker.botId === original.botId)
         : null
       if (!sticky) return null
-      return sticky.ready && !sticky.active && !this.inFlight.has(sticky) && !sticky.recoveringFromDeath && !sticky.emergencyRescueActive ? sticky : null
+      return sticky.ready && !sticky.connectionInvalidated && !sticky.active && !this.inFlight.has(sticky) &&
+        !(sticky.botId && this.hasInFlightCraft(sticky.botId)) && !sticky.recoveringFromDeath && !sticky.emergencyRescueActive ? sticky : null
     }
     // 私聊进来的业务任务绑定接收私信的机器人；该机器人掉线后退回任意空闲机器人，避免任务卡死。
     if (task.stickyWorker && this.workers.has(task.stickyWorker)) {
@@ -150,17 +152,18 @@ class BotTaskPool {
   dispatch () {
     if ([...this.inFlight.values()].some(task => task.exclusive)) return
     if ([...this.workers].some(worker => worker.active?.exclusive)) return
-    if (this.queue[0]?.exclusive) {
-      if (this.inFlight.size || [...this.workers].some(worker => worker.active)) return
-      const worker = this.eligibleWorkerForTask(this.queue[0])
-      if (!worker) return
-      this.run(worker, this.queue.shift())
-      return
-    }
     for (let index = 0; index < this.queue.length; index++) {
       const task = this.queue[index]
-      if (task.exclusive) break
       const worker = this.eligibleWorkerForTask(task)
+      // An offline/busy recovery owner cannot start yet. Keep its bot binding,
+      // but only make it a global barrier once that recovery can actually run.
+      if (task.exclusive) {
+        if (task.type === 'craft_recovery' && !worker) continue
+        if (this.inFlight.size || [...this.workers].some(current => current.active) || !worker) break
+        this.queue.splice(index, 1)
+        this.run(worker, task)
+        return
+      }
       if (!worker) continue
       this.queue.splice(index, 1)
       index--

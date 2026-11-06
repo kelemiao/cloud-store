@@ -229,6 +229,7 @@ class StoreDb {
         nbt_json TEXT NOT NULL DEFAULT '',
         meta_json TEXT NOT NULL DEFAULT '',
         amount INTEGER NOT NULL,
+        balance_adjusted INTEGER NOT NULL DEFAULT 0,
         note TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         resolved_at TEXT
@@ -462,6 +463,19 @@ class StoreDb {
     this.ensureColumn('active_recovery_tasks', 'items_json', "TEXT NOT NULL DEFAULT '[]'")
     this.ensureColumn('active_recovery_tasks', 'deduction_key', "TEXT NOT NULL DEFAULT ''")
     this.ensureColumn('bot_recovery_tasks', 'deduction_key', "TEXT NOT NULL DEFAULT ''")
+    this.transaction(() => {
+      const mismatchAdjustmentAdded = !this.db.prepare('PRAGMA table_info(inventory_mismatches)').all().some(column => column.name === 'balance_adjusted')
+      this.ensureColumn('inventory_mismatches', 'balance_adjusted', 'INTEGER NOT NULL DEFAULT 0')
+      if (!mismatchAdjustmentAdded) return
+      // Older sync/withdraw paths already deducted these shortages but left
+      // only their generated note as evidence. Migrate once before Web review.
+      const update = this.db.prepare('UPDATE inventory_mismatches SET balance_adjusted = ? WHERE id = ?')
+      for (const row of this.db.prepare("SELECT id, amount, note FROM inventory_mismatches WHERE kind = 'missing'").all()) {
+        const match = String(row.note || '').match(/同步发现仓库实物少于账本，已自动扣除账面 x(\d+)/) ||
+          String(row.note || '').match(/账面需修正 \d+，已自动扣除 (\d+)/)
+        if (match) update.run(Math.min(Number(row.amount), Number(match[1])), row.id)
+      }
+    })
     this.db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS uq_withdraw_deduction
       ON transactions (deduction_key, player_uuid)
@@ -2634,7 +2648,8 @@ class StoreDb {
             username,
             complete,
             amount,
-            `${notePrefix}：账面需修正 ${amount}，已自动扣除 ${deducted}${deducted < amount ? `（账面仅剩 ${deducted}）` : ''}；账本已与实物同步，留痕待管理员复核。`
+            `${notePrefix}：账面需修正 ${amount}，已自动扣除 ${deducted}${deducted < amount ? `（账面仅剩 ${deducted}）` : ''}；账本已与实物同步，留痕待管理员复核。`,
+            deducted
           )
         }
         results.push({ itemKey: item.itemKey, requested: amount, deducted })
@@ -2772,10 +2787,18 @@ class StoreDb {
       : this.db.prepare("SELECT 1 FROM craft_operations WHERE state NOT IN ('completed','complete','failed') LIMIT 1").get())
   }
 
+  pendingCraftBotIds () {
+    if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='craft_operations'").get()) return []
+    return this.db.prepare("SELECT DISTINCT bot_id AS botId FROM craft_operations WHERE state NOT IN ('completed','complete','failed') ORDER BY bot_id")
+      .all().map(row => String(row.botId || ''))
+  }
+
   assertNoPendingCraft (allowedOperationId = '') {
     if (!this.hasPendingCraft()) return
     if (allowedOperationId && !this.db.prepare("SELECT 1 FROM craft_operations WHERE state NOT IN ('completed','complete','failed') AND id <> ? LIMIT 1").get(String(allowedOperationId))) return
-    throw new Error('合成仍在进行或等待恢复；为保护物品归属，暂停库存变更和同步，请执行 !合成恢复。')
+    const owners = this.pendingCraftBotIds().filter(Boolean)
+    const suffix = owners.length ? `（待恢复记录所属机器人：${owners.join('、')}）` : ''
+    throw new Error('合成仍在进行或等待恢复；为保护物品归属，暂停库存变更和同步，请执行 !合成恢复。' + suffix)
   }
 
   adjustBalance (ownerUuid, itemKey, delta) {
@@ -3523,15 +3546,17 @@ class StoreDb {
     `).get(String(ownerUuid || ''), String(itemKey || '')))
   }
 
-  addInventoryMismatch (kind, ownerUuid, username, item, amount, note = '') {
+  addInventoryMismatch (kind, ownerUuid, username, item, amount, note = '', balanceAdjusted = 0) {
     if (!amount || amount <= 0 || !item?.itemKey) return
+    const adjusted = Number(balanceAdjusted)
+    if (!Number.isSafeInteger(adjusted) || adjusted < 0 || adjusted > amount) throw new Error('inventory mismatch balance adjustment is invalid')
     this.upsertItem(this.rowToItem(item))
     this.db.prepare(`
       INSERT INTO inventory_mismatches (
         kind, status, owner_uuid, username, item_key, item_id, display_name,
-        nbt_json, meta_json, amount, note
+        nbt_json, meta_json, amount, note, balance_adjusted
       )
-      VALUES (?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       kind,
       ownerUuid || '',
@@ -3542,7 +3567,8 @@ class StoreDb {
       item.nbtJson || '',
       item.metaJson || '',
       amount,
-      note
+      note,
+      adjusted
     )
   }
 
@@ -3560,25 +3586,46 @@ class StoreDb {
     `).run(note, note, note).changes
   }
 
-  reconcileTotalsToMomo (actualTotals) {
-    this.assertNoPendingCraft()
+  reconcileTotalsToMomo (actualTotals, allowedOperationId = '') {
+    // Recovery uses the same global reconciliation policy as normal sync. Its
+    // own durable journal is exempt only inside this synchronous transaction.
+    const operationId = String(allowedOperationId || '')
+    this.assertNoPendingCraft(operationId)
+    const context = this.transactionContext.getStore() || {}
+    return this.transactionContext.run({ ...context, craftOperationId: operationId }, () => this.reconcileTotalsToMomoAllowed(actualTotals))
+  }
+
+  reconcileRecoveryDeltaToMomo (baselineTotals, actualTotals, allowedOperationId = '') {
+    if (!Array.isArray(baselineTotals) || !Array.isArray(actualTotals)) throw new Error('recovery reconciliation requires baseline and current totals')
+    const operationId = String(allowedOperationId || '')
+    this.assertNoPendingCraft(operationId)
+    const context = this.transactionContext.getStore() || {}
+    return this.transactionContext.run({ ...context, craftOperationId: operationId }, () =>
+      this.reconcileTotalsToMomoAllowed(actualTotals, baselineTotals))
+  }
+
+  reconcileTotalsToMomoAllowed (actualTotals, baselineTotals = null) {
+    this.assertNoPendingCraft(this.transactionContext.getStore()?.craftOperationId || '')
     const ledgerRows = this.getLedgerTotals()
     const ledger = new Map(ledgerRows.map(row => [row.itemKey, row]))
     const actual = new Map(actualTotals.map(row => [row.itemKey, row]))
-    const keys = new Set([...ledger.keys(), ...actual.keys()])
+    const baseline = baselineTotals ? new Map(baselineTotals.map(row => [row.itemKey, row])) : null
+    const reference = baseline || ledger
+    const keys = new Set([...reference.keys(), ...actual.keys()])
     const addedToMomo = []
     const removedFromMomo = []
     const unresolved = []
 
     this.transaction(() => {
-      this.resolveOpenInventoryMismatches('新的同步已刷新库存异常状态。')
+      if (!baseline) this.resolveOpenInventoryMismatches('新的同步已刷新库存异常状态。')
 
       for (const key of keys) {
         const actualRow = actual.get(key)
-        const ledgerAmount = ledger.get(key)?.amount || 0
+        const referenceRow = reference.get(key)
+        const ledgerAmount = referenceRow?.amount || 0
         const actualAmount = actualRow?.amount || 0
         const diff = actualAmount - ledgerAmount
-        const item = actualRow || ledger.get(key)
+        const item = actualRow || referenceRow || ledger.get(key)
 
         if (item) this.upsertItem(this.rowToItem(item))
 
@@ -3606,7 +3653,9 @@ class StoreDb {
                   allocation.username,
                   missingItem,
                   allocation.amount,
-                  '同步发现仓库实物少于账本；无法归属到任何账面持有者，未自动扣除。'
+                  baseline
+                    ? '合成恢复对账发现实物净减少；无法归属到任何账面持有者，未自动扣除。'
+                    : '同步发现仓库实物少于账本；无法归属到任何账面持有者，未自动扣除。'
                 )
                 continue
               }
@@ -3633,8 +3682,9 @@ class StoreDb {
                 missingItem,
                 allocation.amount,
                 deducted <= 0
-                  ? '同步发现仓库实物少于账本，账面已无可扣除数量；留痕待管理员复核。'
-                  : `同步发现仓库实物少于账本，已自动扣除账面 x${deducted}${deducted < allocation.amount ? `（请求扣 ${allocation.amount}，账面仅剩 ${deducted}）` : ''}；留痕待管理员复核。`
+                  ? (baseline ? '合成恢复对账发现实物净减少，账面已无可扣除数量；留痕待管理员复核。' : '同步发现仓库实物少于账本，账面已无可扣除数量；留痕待管理员复核。')
+                  : `${baseline ? '合成恢复对账发现实物净减少' : '同步发现仓库实物少于账本'}，已自动扣除账面 x${deducted}${deducted < allocation.amount ? `（请求扣 ${allocation.amount}，账面仅剩 ${deducted}）` : ''}；留痕待管理员复核。`,
+                deducted
               )
             }
           }
@@ -3648,7 +3698,9 @@ class StoreDb {
           'momo',
           item,
           item.amount,
-          '同步发现仓库实物多于账本，已自动划入 momo，可在查看器转移给正确归属。'
+            baseline
+              ? '合成恢复对账发现实物净增加，已按同步规则划入 momo，可在查看器转移给正确归属。'
+              : '同步发现仓库实物多于账本，已自动划入 momo，可在查看器转移给正确归属。'
         )
       }
     })

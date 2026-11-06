@@ -6,6 +6,7 @@ const StoreDb = require('../../src/db')
 const ItemCatalog = require('../../src/itemCatalog')
 const { CraftController } = require('../../src/craft/controller')
 const { DEFAULT_CONFIG } = require('../../src/config')
+const { attachRecoverySnapshots } = require('./recovery-snapshot-fixture')
 
 // 自动恢复回归（2026-11-05 生产事故）：合成失败留下 recovery_required 记录后，
 // 唯一会自动恢复的路径是 bot 掉线重连/重启（start 钩子），bot 存活期间全库被
@@ -62,6 +63,7 @@ function fixture () {
     refreshChestSnapshot: () => refresh(),
     closeContainerQuietly: () => {}
   }
+  attachRecoverySnapshots(warehouse, bot, catalog, () => [...stored.values()])
   function seed (owner, name, count) {
     const item = make(name, count)
     const row = catalog.fromPrismarineItem(item)
@@ -162,7 +164,7 @@ test('an unrecoverable reconciliation mismatch settles as a registered diff and 
     assert.equal(f.controller.ledger.pending('bot-a').length, 0, 'mismatch must settle, not lock the store')
     // 差异登记进库存异常（cobblestone 多 1），管理员可在 Web 复核。
     const mismatches = f.db.db.prepare('SELECT * FROM inventory_mismatches WHERE status = ?').all('open')
-    assert.ok(mismatches.some(row => row.kind === 'excess' && row.amount === 1), 'excess cobblestone registered')
+    assert.ok(mismatches.some(row => row.kind === 'extra' && row.amount === 1), 'extra cobblestone registered')
     // 未动 alice 的既有账面：原料归属保留。
     assert.equal(f.db.getBalance('alice', plank.itemKey), 2)
     assert.equal(f.db.getBalance('alice', stick.itemKey), 4)
@@ -172,6 +174,15 @@ test('an unrecoverable reconciliation mismatch settles as a registered diff and 
 test('run() self-heals a leftover pending journal before starting the new craft', async () => {
   const f = fixture()
   try {
+    const { AsyncMutex } = require('../../src/taskPool')
+    const mutex = new AsyncMutex()
+    let locked = false
+    f.warehouse.withWarehouseLock = async fn => {
+      assert.equal(locked, false, 'old recovery must finish before the new craft lock')
+      locked = true
+      try { return await mutex.run(fn) } finally { locked = false }
+    }
+
     const plank = f.seed('alice', 'oak_planks', 2)
     // 上一次失败留下的恢复记录（模拟进程重启后新请求进来）。
     const ledger = f.controller.ledger

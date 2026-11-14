@@ -17,16 +17,18 @@ function sameSnapshotItems (left = [], right = []) {
 }
 
 // A craft batch may reuse an already opened barrel only when all evidence still
-// describes the same server-owned state. This deliberately accepts snapshots
-// from tests without a bot inventory aggregate, while production callers pass
-// both the window and the bot inventory view.
-function canReuseCraftWindow ({ expectedRevision, currentRevision, bot, container, serverSnapshot, localSnapshot }) {
+// describes the same server-owned state. Mineflayer mirrors the open window's
+// player slots to bot.inventory only on close, so its unchanged opening view is
+// also valid while the window itself matches the latest full server snapshot.
+function canReuseCraftWindow ({ expectedRevision, currentRevision, bot, container, serverSnapshot, localSnapshot, initialBotPlayerItems }) {
   if (expectedRevision !== currentRevision || !bot || bot.currentWindow !== container) return false
   if (!container || container.selectedItem || bot.inventory?.selectedItem) return false
+  if (bot.inventory?.slots?.slice(0, 5).some(Boolean)) return false
   if (!serverSnapshot || serverSnapshot.cursorEmpty !== true || !localSnapshot) return false
   if (!sameSnapshotSlots(serverSnapshot.chestSlots, localSnapshot.chestSlots) ||
       !sameSnapshotItems(serverSnapshot.playerItems, localSnapshot.playerItems)) return false
-  if (localSnapshot.botPlayerItems && !sameSnapshotItems(serverSnapshot.playerItems, localSnapshot.botPlayerItems)) return false
+  if (localSnapshot.botPlayerItems && !sameSnapshotItems(serverSnapshot.playerItems, localSnapshot.botPlayerItems) &&
+      (!initialBotPlayerItems || !sameSnapshotItems(initialBotPlayerItems, localSnapshot.botPlayerItems))) return false
   return true
 }
 
@@ -95,9 +97,16 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
     decodeError = null
     if (Number.isInteger(windowId(packet))) opened.add(windowId(packet))
   }
+  const invalidate = () => {
+    latest = null
+    packets.length = 0
+  }
   const onItems = packet => {
+    if (keepEvidence && windowId(packet) === 0) invalidate()
+    if (!opened.has(windowId(packet))) return
+    if (keepEvidence) invalidate()
     const items = packet?.items ?? packet?.slots
-    if (opened.has(windowId(packet)) && Array.isArray(items)) {
+    if (Array.isArray(items)) {
       const copy = deserialize(serialize({ ...packet, windowId: windowId(packet), items }))
       packets.push(copy)
       try {
@@ -108,8 +117,20 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
       }
     }
   }
-  for (const event of ['open_window', 'open_screen']) client.on(event, onOpen)
-  for (const event of ['window_items', 'container_set_content']) client.on(event, onItems)
+  const onSlot = packet => {
+    const id = windowId(packet)
+    if (opened.has(id) || [0, -1, 255, -2, 254].includes(id)) invalidate()
+  }
+  const listeners = [
+    ['open_window', onOpen], ['open_screen', onOpen],
+    ['window_items', onItems], ['container_set_content', onItems]
+  ]
+  if (keepEvidence) listeners.push(
+    ['set_slot', onSlot], ['container_set_slot', onSlot],
+    ['set_cursor_item', invalidate], ['container_set_cursor_item', invalidate],
+    ['set_player_inventory', invalidate]
+  )
+  for (const [event, listener] of listeners) client.on(event, listener)
   let container
   let handedOff = false
   try {
@@ -136,23 +157,24 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
       throw new Error(`无法解码服务端容器快照：${error.message}`)
     }
     if (decodeError) throw new Error(`无法持续解码服务端容器快照：${decodeError.message}`)
+    const initialBotPlayerItems = keepEvidence ? containerSnapshot(container, catalog, bot)?.botPlayerItems : null
     const evidence = {
       revision,
       windowId: container.id,
       current: () => latest,
-      isReusable: () => canReuseCraftWindow({
+      isReusable: () => !disposed && canReuseCraftWindow({
         expectedRevision: revision,
         currentRevision: currentRevision(warehouse, chest.chestId),
         bot,
         container,
         serverSnapshot: decodeError ? null : latest,
-        localSnapshot: containerSnapshot(container, catalog, bot)
+        localSnapshot: containerSnapshot(container, catalog, bot),
+        initialBotPlayerItems
       }),
       dispose: () => {
         if (disposed) return
         disposed = true
-        for (const event of ['open_window', 'open_screen']) client.removeListener(event, onOpen)
-        for (const event of ['window_items', 'container_set_content']) client.removeListener(event, onItems)
+        for (const [event, listener] of listeners) client.removeListener(event, listener)
       }
     }
     if (!keepEvidence) {
@@ -166,8 +188,7 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
     throw error
   } finally {
     if (!handedOff) {
-      for (const event of ['open_window', 'open_screen']) client.removeListener(event, onOpen)
-      for (const event of ['window_items', 'container_set_content']) client.removeListener(event, onItems)
+      for (const [event, listener] of listeners) client.removeListener(event, listener)
     }
   }
 }

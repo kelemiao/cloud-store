@@ -385,6 +385,8 @@ class Warehouse {
     const local = snapshotCraftWindow(container, this.catalog, this.bot)
     evidence?.dispose?.()
     this.closeContainerQuietly(container)
+    // Mineflayer copies the window's player slots into bot.inventory on close.
+    const closedPlayer = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
 
     let reopened
     try {
@@ -393,10 +395,12 @@ class Warehouse {
       error.uncertainTransfer = true
       throw error
     }
-    const botMatches = local?.botPlayerItems == null || this.sameCraftItems(reopened.playerItems, local.botPlayerItems)
+    const botMatches = this.sameCraftItems(reopened.playerItems, closedPlayer) &&
+      this.sameCraftItems(reopened.playerItems, this.catalog.aggregatePrismarineItems(this.bot.inventory.items()))
     const matches = local && this.sameCraftChestSlots(reopened.chestSlots, local.chestSlots) &&
       this.sameCraftItems(reopened.playerItems, local.playerItems) && botMatches &&
-      !reopened.container.selectedItem && !this.bot.inventory.selectedItem
+      !reopened.container.selectedItem && !this.bot.inventory.selectedItem &&
+      !this.bot.inventory.slots?.slice(0, 5).some(Boolean)
     if (!matches) {
       this.closeContainerQuietly(reopened.container)
       reopened.evidence?.dispose?.()
@@ -824,7 +828,6 @@ class Warehouse {
           decision: `定位到木桶 ${this.describeChest(chest)}（账本 ${group.recordedAmount} 个），走去打开`
         })
         let container
-        let evidence
         if (options.requireServerEvidence) {
           let snapshot
           try { snapshot = await openServerContainer(this, chest, this.catalog, this.bot) } catch (error) {
@@ -832,7 +835,6 @@ class Warehouse {
             throw error
           }
           container = snapshot.container
-          evidence = snapshot.evidence
           const recorded = this.db.listChestSlots().filter(row => row.chestId === chest.chestId && Number.isInteger(row.slot))
             .map(row => ({ slot: row.slot, itemKey: row.itemKey, amount: Number(row.amount) }))
           const localChest = this.containerContentItems(container).map(item => ({
@@ -991,7 +993,6 @@ class Warehouse {
           })
           throw error
         } finally {
-          evidence?.dispose?.()
           this.closeContainerQuietly(container)
         }
         if (options.requireServerEvidence && transferAttempted) await this.verifyCraftContainer(chest)
@@ -1129,7 +1130,7 @@ class Warehouse {
         throw error
       } finally {
         evidence?.dispose?.()
-        this.closeContainerQuietly(container)
+        if (this.bot.currentWindow === container) this.closeContainerQuietly(container)
       }
     }
 
